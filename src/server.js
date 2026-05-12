@@ -196,7 +196,15 @@ function handleControllerJoin(socket, msg) {
       break;
     }
   }
-  if (!slot) return sendError(socket.ws, "room_full", "This game session is full.");
+  if (!slot) {
+    socket.waitingController = { platformSessionId: session.platformSessionId };
+    return safeSend(socket.ws, {
+      type: "controller_waiting",
+      platformSessionId: session.platformSessionId,
+      gameId: session.gameId,
+      message: "Game Room is Full. Wait.",
+    });
+  }
 
   const controllerToken = id("controller");
   session.players.set(slot, {
