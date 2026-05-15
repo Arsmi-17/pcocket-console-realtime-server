@@ -3,7 +3,13 @@ import crypto from "node:crypto";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.REALTIME_PORT || process.env.PORT || 3010);
-const CODE_TTL_MS = Number(process.env.POCKET_CODE_TTL_MS || 10 * 60 * 1000);
+const CODE_TTL_MS = (() => {
+  const raw = process.env.POCKET_CODE_TTL_MS;
+  if (raw == null || raw === "") return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+})();
 const CONTROLLER_GRACE_MS = Number(process.env.POCKET_CONTROLLER_GRACE_MS || 30 * 1000);
 
 const server = http.createServer((req, res) => {
@@ -100,7 +106,7 @@ function getActiveUserIds() {
 function cleanupExpiredCodes() {
   const t = now();
   for (const [code, entry] of pocketByCode.entries()) {
-    if (entry.expiresAt <= t) pocketByCode.delete(code);
+    if (entry.expiresAt != null && entry.expiresAt <= t) pocketByCode.delete(code);
   }
 }
 
@@ -130,7 +136,14 @@ function handleHostRegister(socket, msg) {
   const platformSessionId = String(msg.platformSessionId || id("platform"));
   const gameId = String(msg.gameId || "");
   const maxPlayers = Math.max(1, Math.min(Number(msg.maxPlayers || 1), 16));
-  const joinCode = makeCode();
+  const requestedJoinCode = String(msg.joinCode || "").trim();
+  const joinCode = (() => {
+    if (/^\d{6}$/.test(requestedJoinCode)) {
+      const existing = pocketByCode.get(requestedJoinCode);
+      if (!existing || existing.platformSessionId === platformSessionId) return requestedJoinCode;
+    }
+    return makeCode();
+  })();
 
   const previous = pocketSessions.get(platformSessionId);
   if (previous?.joinCode) pocketByCode.delete(previous.joinCode);
@@ -142,19 +155,21 @@ function handleHostRegister(socket, msg) {
     hostUserId: socket.userId || String(msg.hostUserId || ""),
     maxPlayers,
     joinCode,
+    controllerHostSlot: null,
+    controllerHostUserId: null,
     players: new Map(),
     createdAt: now(),
   };
 
   pocketSessions.set(platformSessionId, session);
-  pocketByCode.set(joinCode, { platformSessionId, expiresAt: now() + CODE_TTL_MS });
+  pocketByCode.set(joinCode, { platformSessionId, expiresAt: CODE_TTL_MS ? now() + CODE_TTL_MS : null });
   socket.platformSessionId = platformSessionId;
 
   safeSend(socket.ws, {
     type: "host_registered",
     platformSessionId,
     joinCode,
-    expiresAt: new Date(now() + CODE_TTL_MS).toISOString(),
+    expiresAt: CODE_TTL_MS ? new Date(now() + CODE_TTL_MS).toISOString() : null,
   });
 }
 
@@ -164,19 +179,20 @@ function handleHostRenewCode(socket) {
   if (session.joinCode) pocketByCode.delete(session.joinCode);
   const joinCode = makeCode();
   session.joinCode = joinCode;
-  pocketByCode.set(joinCode, { platformSessionId: session.platformSessionId, expiresAt: now() + CODE_TTL_MS });
+  pocketByCode.set(joinCode, { platformSessionId: session.platformSessionId, expiresAt: CODE_TTL_MS ? now() + CODE_TTL_MS : null });
   safeSend(socket.ws, {
     type: "host_code_renewed",
     platformSessionId: session.platformSessionId,
     joinCode,
-    expiresAt: new Date(now() + CODE_TTL_MS).toISOString(),
+    expiresAt: CODE_TTL_MS ? new Date(now() + CODE_TTL_MS).toISOString() : null,
   });
 }
 
 function handleGameReady(socket, msg) {
   const session = pocketSessions.get(socket.platformSessionId);
   if (!session) return sendError(socket.ws, "session_not_found", "Register host before game_ready.");
-  session.maxPlayers = Math.max(1, Math.min(Number(msg.maxPlayers || session.maxPlayers), 16));
+  const nextMaxPlayers = Math.max(1, Math.min(Number(msg.maxPlayers || session.maxPlayers), 16));
+  session.maxPlayers = Math.max(session.maxPlayers || 1, nextMaxPlayers);
   session.controllerSchema = msg.controllerSchema || null;
   safeSend(socket.ws, { type: "game_ready_ack", platformSessionId: session.platformSessionId });
 }
@@ -207,11 +223,16 @@ function handleControllerJoin(socket, msg) {
   }
 
   const controllerToken = id("controller");
+  const joiningUserId = socket.userId || String(msg.userId || "");
+  if (session.controllerHostSlot == null) session.controllerHostSlot = slot;
+  if (session.controllerHostUserId == null && joiningUserId) session.controllerHostUserId = joiningUserId;
   session.players.set(slot, {
     socketId: socket.id,
     controllerToken,
-    userId: socket.userId || String(msg.userId || ""),
+    userId: joiningUserId,
     displayName: String(msg.displayName || ""),
+    avatarPath: String(msg.avatarPath || ""),
+    avatarUrl: String(msg.avatarUrl || ""),
     connected: true,
     joinedAt: now(),
   });
@@ -223,6 +244,8 @@ function handleControllerJoin(socket, msg) {
     platformSessionId: session.platformSessionId,
     gameId: session.gameId,
     playerSlot: slot,
+    hostSlot: session.controllerHostSlot,
+    hostUserId: session.controllerHostUserId,
     controllerToken,
     schema: session.controllerSchema || null,
   });
@@ -230,7 +253,12 @@ function handleControllerJoin(socket, msg) {
     type: "pocket_player_joined",
     platformSessionId: session.platformSessionId,
     playerSlot: slot,
+    hostSlot: session.controllerHostSlot,
+    hostUserId: session.controllerHostUserId,
     displayName: String(msg.displayName || ""),
+    avatarPath: String(msg.avatarPath || ""),
+    avatarUrl: String(msg.avatarUrl || ""),
+    userId: joiningUserId,
   });
 }
 
@@ -254,6 +282,8 @@ function handleControllerReconnect(socket, msg) {
     platformSessionId: session.platformSessionId,
     gameId: session.gameId,
     playerSlot: token.slot,
+    hostSlot: session.controllerHostSlot,
+    hostUserId: session.controllerHostUserId,
     controllerToken,
     schema: session.controllerSchema || null,
   });
@@ -261,6 +291,12 @@ function handleControllerReconnect(socket, msg) {
     type: "pocket_player_reconnected",
     platformSessionId: session.platformSessionId,
     playerSlot: token.slot,
+    hostSlot: session.controllerHostSlot,
+    hostUserId: session.controllerHostUserId,
+    displayName: String(player.displayName || ""),
+    avatarPath: String(player.avatarPath || ""),
+    avatarUrl: String(player.avatarUrl || ""),
+    userId: String(player.userId || ""),
   });
 }
 
@@ -269,12 +305,180 @@ function handleControllerInput(socket, msg) {
   if (!controller) return sendError(socket.ws, "not_joined", "Controller has not joined a session.");
   const session = pocketSessions.get(controller.platformSessionId);
   if (!session) return sendError(socket.ws, "session_not_found", "Game session is not available.");
+  const player = session.players.get(controller.slot) || {};
+
+  const input = msg.input || {};
+  const wantsProfileUpdate = String(input?.control || "") === "profile_update";
+  const displayNameOverride = String(msg.displayName || "").trim();
+  const avatarPathOverride = String(msg.avatarPath || "").trim();
+  const avatarUrlOverride = String(msg.avatarUrl || "").trim();
+  const userIdOverride = String(msg.userId || "").trim();
+
+  if (wantsProfileUpdate || displayNameOverride || avatarPathOverride || avatarUrlOverride) {
+    if (displayNameOverride) player.displayName = displayNameOverride;
+    if (avatarPathOverride) player.avatarPath = avatarPathOverride;
+    if (avatarUrlOverride) player.avatarUrl = avatarUrlOverride;
+    if (userIdOverride) player.userId = userIdOverride;
+  }
+
+  if (wantsProfileUpdate) {
+    safeSend(sockets.get(session.hostSocketId)?.ws, {
+      type: "pocket_player_updated",
+      platformSessionId: session.platformSessionId,
+      playerSlot: controller.slot,
+      hostSlot: session.controllerHostSlot,
+      hostUserId: session.controllerHostUserId,
+      displayName: String(player.displayName || ""),
+      avatarPath: String(player.avatarPath || ""),
+      avatarUrl: String(player.avatarUrl || ""),
+      userId: String(player.userId || ""),
+    });
+  }
   safeSend(sockets.get(session.hostSocketId)?.ws, {
     type: "pocket_input",
     platformSessionId: session.platformSessionId,
     playerSlot: controller.slot,
-    input: msg.input || {},
+    hostSlot: session.controllerHostSlot,
+    hostUserId: session.controllerHostUserId,
+    displayName: String(player.displayName || ""),
+    avatarPath: String(player.avatarPath || ""),
+    avatarUrl: String(player.avatarUrl || ""),
+    userId: String(player.userId || ""),
+    input,
     sequence: msg.sequence ?? null,
+  });
+}
+
+function handleControllerUpdateProfile(socket, msg) {
+  const controllerToken = String(msg.controllerToken || socket.controller?.controllerToken || "").trim();
+  const token = controllerTokens.get(controllerToken);
+  if (!token) return sendError(socket.ws, "invalid_controller_token", "Controller session expired.");
+
+  const session = pocketSessions.get(token.platformSessionId);
+  const player = session?.players.get(token.slot);
+  if (!session || !player || player.controllerToken !== controllerToken) {
+    controllerTokens.delete(controllerToken);
+    return sendError(socket.ws, "invalid_controller_token", "Controller session expired.");
+  }
+
+  const displayName = String(msg.displayName || player.displayName || "");
+  const avatarPath = String(msg.avatarPath || player.avatarPath || "");
+  const avatarUrl = String(msg.avatarUrl || avatarPath || player.avatarUrl || "");
+  const userId = String(msg.userId || player.userId || "");
+
+  player.displayName = displayName;
+  player.avatarPath = avatarPath;
+  player.avatarUrl = avatarUrl;
+  if (userId) player.userId = userId;
+
+  safeSend(socket.ws, { type: "controller_profile_updated", playerSlot: token.slot });
+  safeSend(sockets.get(session.hostSocketId)?.ws, {
+    type: "pocket_player_updated",
+    platformSessionId: session.platformSessionId,
+    playerSlot: token.slot,
+    hostSlot: session.controllerHostSlot,
+    hostUserId: session.controllerHostUserId,
+    displayName,
+    avatarPath,
+    avatarUrl,
+    userId,
+  });
+}
+
+function handleControllerPlaySound(socket, msg) {
+  const controllerToken = String(msg.controllerToken || socket.controller?.controllerToken || "").trim();
+  const token = controllerTokens.get(controllerToken);
+  if (!token) return sendError(socket.ws, "invalid_controller_token", "Controller session expired.");
+
+  const session = pocketSessions.get(token.platformSessionId);
+  const player = session?.players.get(token.slot);
+  if (!session || !player || player.controllerToken !== controllerToken) {
+    controllerTokens.delete(controllerToken);
+    return sendError(socket.ws, "invalid_controller_token", "Controller session expired.");
+  }
+
+  const soundId = String(msg.soundId || "").trim();
+  if (!soundId) return sendError(socket.ws, "invalid_sound", "soundId is required.");
+  const soundUrl = String(msg.soundUrl || "").trim();
+  const soundTitle = String(msg.soundTitle || "").trim();
+  const gifUrl = String(msg.gifUrl || "").trim();
+
+  console.log("[pocket] controller_play_sound", {
+    platformSessionId: session.platformSessionId,
+    slot: token.slot,
+    soundId,
+  });
+
+  safeSend(sockets.get(session.hostSocketId)?.ws, {
+    type: "pocket_sound",
+    platformSessionId: session.platformSessionId,
+    playerSlot: token.slot,
+    hostSlot: session.controllerHostSlot,
+    hostUserId: session.controllerHostUserId,
+    soundId,
+    soundUrl,
+    soundTitle,
+    gifUrl,
+    displayName: String(player.displayName || ""),
+    avatarPath: String(player.avatarPath || ""),
+    avatarUrl: String(player.avatarUrl || ""),
+    userId: String(player.userId || ""),
+    ts: now(),
+  });
+}
+
+function handleControllerSelectEmoji(socket, msg) {
+  const controllerToken = String(msg.controllerToken || socket.controller?.controllerToken || "").trim();
+  const token = controllerTokens.get(controllerToken);
+  if (!token) return sendError(socket.ws, "invalid_controller_token", "Controller session expired.");
+
+  const session = pocketSessions.get(token.platformSessionId);
+  const player = session?.players.get(token.slot);
+  if (!session || !player || player.controllerToken !== controllerToken) {
+    controllerTokens.delete(controllerToken);
+    return sendError(socket.ws, "invalid_controller_token", "Controller session expired.");
+  }
+
+  const emojiId = String(msg.emojiId || "").trim();
+  if (!emojiId) return sendError(socket.ws, "invalid_emoji", "emojiId is required.");
+  const emoji = String(msg.emoji || "").trim();
+  const gifUrl = String(msg.gifUrl || "").trim();
+
+  console.log("[pocket] controller_select_emoji", {
+    platformSessionId: session.platformSessionId,
+    slot: token.slot,
+    emojiId,
+  });
+
+  safeSend(sockets.get(session.hostSocketId)?.ws, {
+    type: "pocket_emoji",
+    platformSessionId: session.platformSessionId,
+    playerSlot: token.slot,
+    hostSlot: session.controllerHostSlot,
+    hostUserId: session.controllerHostUserId,
+    emojiId,
+    emoji,
+    gifUrl,
+    displayName: String(player.displayName || ""),
+    avatarPath: String(player.avatarPath || ""),
+    avatarUrl: String(player.avatarUrl || ""),
+    userId: String(player.userId || ""),
+    ts: now(),
+  });
+}
+
+function handleControllerLaunchGame(socket, msg) {
+  const controller = socket.controller;
+  if (!controller) return sendError(socket.ws, "not_joined", "Controller has not joined a session.");
+  const session = pocketSessions.get(controller.platformSessionId);
+  if (!session) return sendError(socket.ws, "session_not_found", "Game session is not available.");
+  safeSend(sockets.get(session.hostSocketId)?.ws, {
+    type: "pocket_launch_game",
+    platformSessionId: session.platformSessionId,
+    playerSlot: controller.slot,
+    gameId: String(msg.gameId || ""),
+    slug: String(msg.slug || ""),
+    title: String(msg.title || ""),
   });
 }
 
@@ -495,6 +699,18 @@ function handleMessage(socket, msg) {
       break;
     case "controller_input":
       handleControllerInput(socket, msg);
+      break;
+    case "controller_update_profile":
+      handleControllerUpdateProfile(socket, msg);
+      break;
+    case "controller_play_sound":
+      handleControllerPlaySound(socket, msg);
+      break;
+    case "controller_select_emoji":
+      handleControllerSelectEmoji(socket, msg);
+      break;
+    case "controller_launch_game":
+      handleControllerLaunchGame(socket, msg);
       break;
     case "challenge_create":
       handleChallengeCreate(socket, msg);
