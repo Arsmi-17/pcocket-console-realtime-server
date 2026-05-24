@@ -10,7 +10,6 @@ const CODE_TTL_MS = (() => {
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return parsed;
 })();
-const CONTROLLER_GRACE_MS = Number(process.env.POCKET_CONTROLLER_GRACE_MS || 30 * 1000);
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
@@ -110,26 +109,121 @@ function cleanupExpiredCodes() {
   }
 }
 
-function cleanupDisconnectedControllers() {
-  const t = now();
-  for (const session of pocketSessions.values()) {
-    for (const [slot, player] of session.players.entries()) {
-      if (!player.connected && player.disconnectedAt && t - player.disconnectedAt > CONTROLLER_GRACE_MS) {
-        session.players.delete(slot);
-        if (player.controllerToken) controllerTokens.delete(player.controllerToken);
-        safeSend(sockets.get(session.hostSocketId)?.ws, {
-          type: "pocket_player_left",
-          platformSessionId: session.platformSessionId,
-          playerSlot: slot,
-        });
-      }
+function playerPayload(player) {
+  return {
+    displayName: String(player?.displayName || ""),
+    avatarPath: String(player?.avatarPath || ""),
+    avatarUrl: String(player?.avatarUrl || ""),
+    userId: String(player?.userId || ""),
+  };
+}
+
+function playerSlotPayload(slot, player) {
+  return {
+    slot,
+    playerSlot: slot,
+    ...playerPayload(player),
+  };
+}
+
+function sortedSessionPlayers(session) {
+  return Array.from(session.players.entries()).sort(([a], [b]) => a - b);
+}
+
+function sessionPlayersPayload(session) {
+  return sortedSessionPlayers(session).map(([slot, player]) => playerSlotPayload(slot, player));
+}
+
+function syncControllerHost(session) {
+  const hostPlayer = session.players.get(1) || null;
+  session.controllerHostSlot = hostPlayer ? 1 : null;
+  session.controllerHostUserId = hostPlayer ? String(hostPlayer.userId || "") : null;
+}
+
+function findControllerSlot(session) {
+  for (let i = 1; i <= session.maxPlayers; i += 1) {
+    if (!session.players.has(i)) return i;
+  }
+  return null;
+}
+
+function notifyControllerSlotUpdated(session, slot, player) {
+  safeSend(sockets.get(player.socketId)?.ws, {
+    type: "controller_slot_updated",
+    platformSessionId: session.platformSessionId,
+    gameId: session.gameId,
+    playerSlot: slot,
+    hostSlot: session.controllerHostSlot,
+    hostUserId: session.controllerHostUserId,
+    controllerToken: player.controllerToken,
+    schema: session.controllerSchema || null,
+    players: sessionPlayersPayload(session),
+  });
+}
+
+function sendPocketPlayersSnapshot(session) {
+  safeSend(sockets.get(session.hostSocketId)?.ws, {
+    type: "pocket_players_snapshot",
+    platformSessionId: session.platformSessionId,
+    hostSlot: session.controllerHostSlot,
+    hostUserId: session.controllerHostUserId,
+    players: sessionPlayersPayload(session),
+  });
+}
+
+function compactSessionPlayers(session) {
+  const entries = sortedSessionPlayers(session);
+  const nextPlayers = new Map();
+  const moved = [];
+
+  entries.forEach(([oldSlot, player], index) => {
+    const nextSlot = index + 1;
+    nextPlayers.set(nextSlot, player);
+    if (player.controllerToken) controllerTokens.set(player.controllerToken, { platformSessionId: session.platformSessionId, slot: nextSlot, expiresAt: Infinity });
+    const playerSocket = sockets.get(player.socketId);
+    if (playerSocket?.controller?.controllerToken === player.controllerToken) {
+      playerSocket.controller = { platformSessionId: session.platformSessionId, slot: nextSlot, controllerToken: player.controllerToken };
     }
+    if (oldSlot !== nextSlot) moved.push({ slot: nextSlot, player });
+  });
+
+  session.players = nextPlayers;
+  syncControllerHost(session);
+  return moved;
+}
+
+function removeControllerFromSession(session, slot) {
+  const player = session.players.get(slot);
+  if (!player) return;
+  if (player.controllerToken) controllerTokens.delete(player.controllerToken);
+  session.players.delete(slot);
+  const moved = compactSessionPlayers(session);
+
+  safeSend(sockets.get(session.hostSocketId)?.ws, {
+    type: "pocket_player_left",
+    platformSessionId: session.platformSessionId,
+    playerSlot: slot,
+    hostSlot: session.controllerHostSlot,
+    hostUserId: session.controllerHostUserId,
+    players: sessionPlayersPayload(session),
+  });
+  sendPocketPlayersSnapshot(session);
+
+  for (const movedPlayer of moved) {
+    notifyControllerSlotUpdated(session, movedPlayer.slot, movedPlayer.player);
+    safeSend(sockets.get(session.hostSocketId)?.ws, {
+      type: "pocket_player_updated",
+      platformSessionId: session.platformSessionId,
+      playerSlot: movedPlayer.slot,
+      hostSlot: session.controllerHostSlot,
+      hostUserId: session.controllerHostUserId,
+      ...playerPayload(movedPlayer.player),
+    });
   }
 }
 
 setInterval(() => {
   cleanupExpiredCodes();
-  cleanupDisconnectedControllers();
 }, 5000).unref();
 
 function handleHostRegister(socket, msg) {
@@ -205,13 +299,8 @@ function handleControllerJoin(socket, msg) {
   const session = pocketSessions.get(codeEntry.platformSessionId);
   if (!session) return sendError(socket.ws, "session_not_found", "Game session is not available.");
 
-  let slot = null;
-  for (let i = 1; i <= session.maxPlayers; i += 1) {
-    if (!session.players.has(i)) {
-      slot = i;
-      break;
-    }
-  }
+  const joiningUserId = socket.userId || String(msg.userId || "");
+  const slot = findControllerSlot(session);
   if (!slot) {
     socket.waitingController = { platformSessionId: session.platformSessionId };
     return safeSend(socket.ws, {
@@ -223,10 +312,7 @@ function handleControllerJoin(socket, msg) {
   }
 
   const controllerToken = id("controller");
-  const joiningUserId = socket.userId || String(msg.userId || "");
-  if (session.controllerHostSlot == null) session.controllerHostSlot = slot;
-  if (session.controllerHostUserId == null && joiningUserId) session.controllerHostUserId = joiningUserId;
-  session.players.set(slot, {
+  const player = {
     socketId: socket.id,
     controllerToken,
     userId: joiningUserId,
@@ -235,7 +321,10 @@ function handleControllerJoin(socket, msg) {
     avatarUrl: String(msg.avatarUrl || ""),
     connected: true,
     joinedAt: now(),
-  });
+    disconnectedAt: null,
+  };
+  session.players.set(slot, player);
+  syncControllerHost(session);
   controllerTokens.set(controllerToken, { platformSessionId: session.platformSessionId, slot, expiresAt: Infinity });
   socket.controller = { platformSessionId: session.platformSessionId, slot, controllerToken };
 
@@ -255,11 +344,10 @@ function handleControllerJoin(socket, msg) {
     playerSlot: slot,
     hostSlot: session.controllerHostSlot,
     hostUserId: session.controllerHostUserId,
-    displayName: String(msg.displayName || ""),
-    avatarPath: String(msg.avatarPath || ""),
-    avatarUrl: String(msg.avatarUrl || ""),
-    userId: joiningUserId,
+    ...playerPayload(player),
+    players: sessionPlayersPayload(session),
   });
+  sendPocketPlayersSnapshot(session);
 }
 
 function handleControllerReconnect(socket, msg) {
@@ -777,14 +865,8 @@ wss.on("connection", (ws) => {
     if (socket.controller) {
       const session = pocketSessions.get(socket.controller.platformSessionId);
       const player = session?.players.get(socket.controller.slot);
-      if (player) {
-        player.connected = false;
-        player.disconnectedAt = now();
-        safeSend(sockets.get(session.hostSocketId)?.ws, {
-          type: "pocket_player_left",
-          platformSessionId: session.platformSessionId,
-          playerSlot: socket.controller.slot,
-        });
+      if (player && player.socketId === socket.id && player.controllerToken === socket.controller.controllerToken) {
+        removeControllerFromSession(session, socket.controller.slot);
       }
     }
     sockets.delete(socket.id);
