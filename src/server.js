@@ -14,7 +14,14 @@ const CODE_TTL_MS = (() => {
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true }));
+    // `capabilities` exists so a client can tell THIS server from an older deployment before
+    // depending on a message that server would silently drop. handleMessage's switch ignores an
+    // unknown `type` — correct for forward compatibility, invisible for diagnosis: the harness
+    // sent host_controller_state to a deployment that predated it, saw no error, and the phone
+    // simply never changed screen. Cost a full debugging session. A capability absent from this
+    // list is how an old server truthfully answers "no", without the old server needing to know
+    // the question.
+    res.end(JSON.stringify({ ok: true, capabilities: ["pocket_state"] }));
     return;
   }
   res.writeHead(404);
@@ -157,6 +164,9 @@ function notifyControllerSlotUpdated(session, slot, player) {
     hostUserId: session.controllerHostUserId,
     controllerToken: player.controllerToken,
     schema: session.controllerSchema || null,
+    // Sent here too, not only on join: this fires when compaction renumbered a seat, and the
+    // phone's screen has just been carried to a new slot number.
+    state: effectiveControllerState(session, slot),
     players: sessionPlayersPayload(session),
   });
 }
@@ -174,11 +184,21 @@ function sendPocketPlayersSnapshot(session) {
 function compactSessionPlayers(session) {
   const entries = sortedSessionPlayers(session);
   const nextPlayers = new Map();
+  // Per-seat screens have to be renumbered along with the seats. When seat 2 leaves, seat 3
+  // BECOMES seat 2 — so a seatStates map left keyed by the old numbers would hand the surviving
+  // player the departed player's screen. Rebuilding it from the same old->new mapping both moves
+  // the survivors' screens and drops the leaver's, which is the other half of the requirement.
+  //
+  // A screen set for a seat nobody had taken yet is dropped here: it has no player to follow
+  // through the renumbering, so there is no coherent slot to move it to.
+  const nextSeatStates = new Map();
   const moved = [];
 
   entries.forEach(([oldSlot, player], index) => {
     const nextSlot = index + 1;
     nextPlayers.set(nextSlot, player);
+    const carried = session.seatStates?.get(oldSlot);
+    if (carried) nextSeatStates.set(nextSlot, carried);
     if (player.controllerToken) controllerTokens.set(player.controllerToken, { platformSessionId: session.platformSessionId, slot: nextSlot, expiresAt: Infinity });
     const playerSocket = sockets.get(player.socketId);
     if (playerSocket?.controller?.controllerToken === player.controllerToken) {
@@ -188,8 +208,67 @@ function compactSessionPlayers(session) {
   });
 
   session.players = nextPlayers;
+  session.seatStates = nextSeatStates;
   syncControllerHost(session);
   return moved;
+}
+
+/**
+ * The screen a seat should be showing: its own override, else the all-seats value, else nothing.
+ * Used both when relaying a live change and when replaying to a phone that just arrived.
+ */
+function effectiveControllerState(session, slot) {
+  return session.seatStates.get(slot) || session.controllerState || null;
+}
+
+/**
+ * The host telling a phone which screen to show.
+ *
+ * Everything is validated here because this is the only authority: hostSession.ts deliberately
+ * sends whatever it is given, so that two validators cannot drift apart. `screen` and `data` are
+ * never interpreted — no key is inspected, no default supplied, nothing branches on a game's kind.
+ */
+function handleHostControllerState(socket, msg) {
+  const session = pocketSessions.get(String(msg.platformSessionId || ""));
+  if (!session) return sendError(socket.ws, "session_not_found", "Game session is not available.");
+  if (session.hostSocketId !== socket.id) {
+    return sendError(socket.ws, "not_host", "Only the host may set controller state.");
+  }
+
+  const screen = String(msg.screen || "").trim();
+  if (!screen || screen.length > 64) {
+    return sendError(socket.ws, "invalid_screen", "screen must be 1-64 characters.");
+  }
+
+  const data = msg.data && typeof msg.data === "object" && !Array.isArray(msg.data) ? msg.data : {};
+  // Capped because this is RETAINED per seat and replayed on every reconnect, so an unbounded
+  // payload is not one large message but one large message per reconnect, for the whole session.
+  if (JSON.stringify(data).length > 8192) {
+    return sendError(socket.ws, "state_too_large", "state data exceeds 8KB.");
+  }
+
+  const rawSlot = msg.slot;
+  const slot = rawSlot === null || rawSlot === undefined ? null : Number(rawSlot);
+  if (slot !== null && (!Number.isInteger(slot) || slot < 1 || slot > session.maxPlayers)) {
+    return sendError(socket.ws, "invalid_slot", `slot must be null or 1-${session.maxPlayers}.`);
+  }
+
+  const frame = { type: "pocket_state", platformSessionId: session.platformSessionId, screen, data };
+
+  if (slot === null) {
+    session.controllerState = { screen, data };
+    // An all-seats state is a new baseline, so per-seat overrides go. Without this, a seat left
+    // on "finished" from the last round would stay there for the whole of the next one after the
+    // game said everybody is in the lobby.
+    session.seatStates.clear();
+    for (const player of session.players.values()) safeSend(sockets.get(player.socketId)?.ws, frame);
+    return;
+  }
+
+  session.seatStates.set(slot, { screen, data });
+  const player = session.players.get(slot);
+  // In range but unoccupied is retained rather than refused — replay delivers it on join.
+  if (player) safeSend(sockets.get(player.socketId)?.ws, frame);
 }
 
 function removeControllerFromSession(session, slot) {
@@ -252,6 +331,12 @@ function handleHostRegister(socket, msg) {
     controllerHostSlot: null,
     controllerHostUserId: null,
     players: new Map(),
+    // Which screen each phone is showing. `controllerState` is the value for every seat;
+    // `seatStates` overrides it for one. A separate map rather than a field on the player,
+    // because a game may legitimately set seat 2's screen before seat 2 has joined — there is
+    // no player object then to hang it on, and replay has to deliver it when they arrive.
+    controllerState: null,
+    seatStates: new Map(),
     createdAt: now(),
   };
 
@@ -337,6 +422,10 @@ function handleControllerJoin(socket, msg) {
     hostUserId: session.controllerHostUserId,
     controllerToken,
     schema: session.controllerSchema || null,
+    // Replay, riding along with the seat announcement rather than as a second message: a phone
+    // learns its screen in the same frame that tells it which seat it took, so there is no window
+    // where it is joined but showing the wrong screen.
+    state: effectiveControllerState(session, slot),
   });
   safeSend(sockets.get(session.hostSocketId)?.ws, {
     type: "pocket_player_joined",
@@ -374,6 +463,9 @@ function handleControllerReconnect(socket, msg) {
     hostUserId: session.controllerHostUserId,
     controllerToken,
     schema: session.controllerSchema || null,
+    // The reason retention exists: a player who reloaded mid-round comes back to the screen they
+    // were on, not to the controller's default.
+    state: effectiveControllerState(session, token.slot),
   });
   safeSend(sockets.get(session.hostSocketId)?.ws, {
     type: "pocket_player_reconnected",
@@ -776,6 +868,9 @@ function handleMessage(socket, msg) {
       break;
     case "game_ready":
       handleGameReady(socket, msg);
+      break;
+    case "host_controller_state":
+      handleHostControllerState(socket, msg);
       break;
     case "controller_join":
       socket.displayName = String(msg.displayName || "");
